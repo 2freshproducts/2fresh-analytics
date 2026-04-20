@@ -60,12 +60,14 @@ ALL_TABS = [
 
 # ---------- Apify ----------
 
-def scrape_profile(username: str, results: int = 30) -> list:
+def scrape_profile(username: str, results: int = 100) -> list:
     """One synchronous Apify run. Returns list of video dicts."""
     token = os.environ["APIFY_TOKEN"]
     url = APIFY_SYNC_URL.format(actor=APIFY_ACTOR)
     payload = {
-        "profiles": [username],
+        "profiles": [f"https://www.tiktok.com/@{username}"],
+        "profileScrapeSections": ["videos"],
+        "profileSorting": "latest",
         "resultsPerPage": results,
         "shouldDownloadVideos": False,
         "shouldDownloadCovers": False,
