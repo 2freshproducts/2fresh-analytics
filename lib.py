@@ -35,7 +35,7 @@ ACCOUNTS = {
 
 # clockworks/tiktok-scraper is the most widely used Apify actor for this.
 # Sync endpoint: returns dataset items directly, no polling, cheapest path.
-APIFY_ACTOR = "clockworks~tiktok-scraper"
+APIFY_ACTOR = "clockworks~free-tiktok-scraper"
 APIFY_SYNC_URL = (
     "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
 )
