@@ -1,11 +1,9 @@
 name: Daily TikTok Analytics
-
 on:
   schedule:
     - cron: '45 19 * * *'
     - cron: '45 20 * * *'
   workflow_dispatch:
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -24,4 +22,5 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: python daily.py
