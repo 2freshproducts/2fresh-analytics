@@ -84,35 +84,12 @@ def scrape_profile(username: str, results: int = 30) -> list:
 
 # ---------- Classify ----------
 
-import re
-
-# Matches "Replying to @handle" with ANY whitespace between tokens (incl. NBSP \u00a0),
-# tolerates leading whitespace/zero-width chars, optional leading '#', case-insensitive.
-_COMMENT_REPLY_RE = re.compile(
-    r'^\s*#?\s*replying\s+to\s*@',
-    re.IGNORECASE | re.UNICODE,
-)
-
 def classify(description: str, item: dict = None) -> str:
     """'comreply' if TikTok comment-reply video, else 'scripted'."""
-    # 1. Structured Apify fields (most reliable when present)
-    if item:
-        for key in ("isReplyComment", "replyToComment", "commentReply",
-                    "replyCommentId", "replyToCommentId"):
-            if item.get(key):
-                return "comreply"
-        reply_obj = item.get("reply") or item.get("replyComment") or {}
-        if isinstance(reply_obj, dict) and reply_obj:
-            return "comreply"
-
-    # 2. Text-prefix fallback — normalise tricky TikTok whitespace first
     if not description:
         return "scripted"
-    d = (description
-         .replace("\u00a0", " ")   # non-breaking space → regular space
-         .replace("\u200b", "")    # zero-width space → removed
-         .replace("\ufeff", ""))   # BOM → removed
-    if _COMMENT_REPLY_RE.match(d):
+    d = description.lower()
+    if "replying to @" in d[:120] or "replying to " in d[:120]:
         return "comreply"
     return "scripted"
 
