@@ -1,9 +1,18 @@
-"""Shared helpers for 2fresh TikTok analytics."""
+"""Shared helpers for 2fresh TikTok analytics.
+
+Zero-cost design:
+- Apify synchronous actor call (one request per profile, returns data)
+- Description-based classifier (no Notion / no ML)
+- gspread for Sheets (free)
+- CallMeBot GET for WhatsApp (free)
+"""
+
 import json
 import os
 import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
@@ -11,6 +20,7 @@ from google.oauth2.service_account import Credentials
 MELBOURNE = ZoneInfo("Australia/Melbourne")
 
 ACCOUNTS = {
+    # username_on_tiktok : { sheet tab names, label used in messages }
     "2fresh_._": {
         "scripted_tab": "2F-TalkingHead",
         "comreply_tab": "2F-ComReply",
@@ -23,8 +33,12 @@ ACCOUNTS = {
     },
 }
 
+# clockworks/tiktok-scraper is the most widely used Apify actor for this.
+# Sync endpoint: returns dataset items directly, no polling, cheapest path.
 APIFY_ACTOR = "clockworks~tiktok-scraper"
-APIFY_SYNC_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
+APIFY_SYNC_URL = (
+    "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
+)
 
 VIDEO_HEADER = [
     "Analysis date", "Post date", "Account", "Type", "Description",
@@ -43,7 +57,11 @@ ALL_TABS = [
     "Snapshot",
 ]
 
+
+# ---------- Apify ----------
+
 def scrape_profile(username: str, results: int = 30) -> list:
+    """One synchronous Apify run. Returns list of video dicts."""
     token = os.environ["APIFY_TOKEN"]
     url = APIFY_SYNC_URL.format(actor=APIFY_ACTOR)
     payload = {
@@ -63,13 +81,43 @@ def scrape_profile(username: str, results: int = 30) -> list:
     r.raise_for_status()
     return r.json()
 
-def classify(description: str) -> str:
+
+# ---------- Classify ----------
+
+import re
+
+# Matches "Replying to @handle" with ANY whitespace between tokens (incl. NBSP \u00a0),
+# tolerates leading whitespace/zero-width chars, optional leading '#', case-insensitive.
+_COMMENT_REPLY_RE = re.compile(
+    r'^\s*#?\s*replying\s+to\s*@',
+    re.IGNORECASE | re.UNICODE,
+)
+
+def classify(description: str, item: dict = None) -> str:
+    """'comreply' if TikTok comment-reply video, else 'scripted'."""
+    # 1. Structured Apify fields (most reliable when present)
+    if item:
+        for key in ("isReplyComment", "replyToComment", "commentReply",
+                    "replyCommentId", "replyToCommentId"):
+            if item.get(key):
+                return "comreply"
+        reply_obj = item.get("reply") or item.get("replyComment") or {}
+        if isinstance(reply_obj, dict) and reply_obj:
+            return "comreply"
+
+    # 2. Text-prefix fallback — normalise tricky TikTok whitespace first
     if not description:
         return "scripted"
-    head = description[:100].lower()
-    if "replying to @" in head:
+    d = (description
+         .replace("\u00a0", " ")   # non-breaking space → regular space
+         .replace("\u200b", "")    # zero-width space → removed
+         .replace("\ufeff", ""))   # BOM → removed
+    if _COMMENT_REPLY_RE.match(d):
         return "comreply"
     return "scripted"
+
+
+# ---------- Metrics ----------
 
 def compute_ratios(video: dict) -> dict:
     views = video.get("playCount") or 0
@@ -88,10 +136,14 @@ def compute_ratios(video: dict) -> dict:
         "comment_rate": round(comments / denom * 100, 3),
         "share_rate": round(shares / denom * 100, 3),
         "save_rate": round(saves / denom * 100, 3),
-        "engagement_rate": round((likes + comments + shares + saves) / denom * 100, 3),
+        "engagement_rate": round(
+            (likes + comments + shares + saves) / denom * 100, 3
+        ),
     }
 
+
 def parse_post_date(video: dict):
+    """Return Melbourne-local date for the video, or None."""
     iso = video.get("createTimeISO")
     if not iso:
         ts = video.get("createTime")
@@ -102,6 +154,9 @@ def parse_post_date(video: dict):
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
     return dt.astimezone(MELBOURNE)
 
+
+# ---------- Sheets ----------
+
 def get_sheet():
     sa_json = json.loads(os.environ["GOOGLE_SA_JSON"])
     creds = Credentials.from_service_account_info(
@@ -110,6 +165,7 @@ def get_sheet():
     )
     gc = gspread.authorize(creds)
     return gc.open_by_key(os.environ["SHEET_ID"])
+
 
 def ensure_tabs_and_headers(sheet):
     existing = {ws.title for ws in sheet.worksheets()}
@@ -125,20 +181,29 @@ def ensure_tabs_and_headers(sheet):
     if snap.row_values(1) != SNAPSHOT_HEADER:
         snap.update([SNAPSHOT_HEADER], "A1")
 
+
 def append_row(sheet, tab_name: str, row: list):
     sheet.worksheet(tab_name).append_row(row, value_input_option="USER_ENTERED")
 
+
 def already_ran_today(sheet, today_iso: str) -> bool:
+    """Check Snapshot tab for an entry with today's Melbourne date."""
     try:
         dates = sheet.worksheet("Snapshot").col_values(1)
     except Exception:
         return False
-    return today_iso in dates[1:]
+    return today_iso in dates[1:]  # skip header
+
+
+# ---------- WhatsApp ----------
 
 def send_whatsapp(text: str) -> None:
+    """CallMeBot WhatsApp. Splits long messages to stay under URL limits."""
     phone = os.environ["CALLMEBOT_PHONE"]
     apikey = os.environ["CALLMEBOT_APIKEY"]
     url = "https://api.callmebot.com/whatsapp.php"
+
+    # Chunk by ~1200 chars to stay well under URL / CallMeBot limits
     chunks = []
     buf = ""
     for line in text.split("\n"):
@@ -149,11 +214,13 @@ def send_whatsapp(text: str) -> None:
             buf = f"{buf}\n{line}" if buf else line
     if buf:
         chunks.append(buf)
+
     for chunk in chunks:
         r = requests.get(
             url,
             params={"phone": phone, "text": chunk, "apikey": apikey},
             timeout=30,
         )
+        # CallMeBot returns 203 on success sometimes, so don't .raise_for_status blindly
         if r.status_code >= 400:
             print(f"[whatsapp] ERROR {r.status_code}: {r.text[:200]}")
