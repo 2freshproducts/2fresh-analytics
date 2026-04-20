@@ -1,7 +1,7 @@
 """Shared helpers for 2fresh TikTok analytics.
 
 Zero-cost design:
-- Apify synchronous actor call (one request per profile, returns data)
+- tikwm.com free public API (no signup, no key)
 - Description-based classifier (no Notion / no ML)
 - gspread for Sheets (free)
 - CallMeBot GET for WhatsApp (free)
@@ -9,8 +9,8 @@ Zero-cost design:
 
 import json
 import os
-import urllib.parse
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -33,13 +33,6 @@ ACCOUNTS = {
     },
 }
 
-# clockworks/tiktok-scraper is the most widely used Apify actor for this.
-# Sync endpoint: returns dataset items directly, no polling, cheapest path.
-APIFY_ACTOR = "clockworks~free-tiktok-scraper"
-APIFY_SYNC_URL = (
-    "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
-)
-
 VIDEO_HEADER = [
     "Analysis date", "Post date", "Account", "Type", "Description",
     "URL", "Views", "Likes", "Comments", "Shares", "Saves",
@@ -58,30 +51,92 @@ ALL_TABS = [
 ]
 
 
-# ---------- Apify ----------
+# ---------- tikwm scraper (free, no API key) ----------
 
 def scrape_profile(username: str, results: int = 100) -> list:
-    """One synchronous Apify run. Returns list of video dicts."""
-    token = os.environ["APIFY_TOKEN"]
-    url = APIFY_SYNC_URL.format(actor=APIFY_ACTOR)
-    payload = {
-        "profiles": [f"https://www.tiktok.com/@{username}"],
-        "profileScrapeSections": ["videos"],
-        "profileSorting": "latest",
-        "resultsPerPage": results,
-        "shouldDownloadVideos": False,
-        "shouldDownloadCovers": False,
-        "shouldDownloadSubtitles": False,
-        "shouldDownloadSlideshowImages": False,
+    """
+    Scrape a TikTok profile using tikwm.com's free public API.
+    Returns a list of video dicts normalized to match the Apify shape.
+    """
+    uname = username.lstrip("@")
+    base = "https://tikwm.com/api/user/posts"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://tikwm.com/",
     }
-    r = requests.post(
-        url,
-        params={"token": token},
-        json=payload,
-        timeout=600,
-    )
-    r.raise_for_status()
-    return r.json()
+
+    videos = []
+    cursor = 0
+    page_size = 35  # tikwm caps at ~35 per page
+    author_meta = {}
+
+    while len(videos) < results:
+        params = {
+            "unique_id": uname,
+            "count": page_size,
+            "cursor": cursor,
+        }
+        for attempt in range(4):
+            r = requests.get(base, params=params, headers=headers, timeout=60)
+            if r.status_code == 200:
+                break
+            time.sleep(2 ** attempt)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != 0:
+            raise RuntimeError(f"tikwm error for {uname}: {data.get('msg')}")
+
+        payload = data.get("data") or {}
+        items = payload.get("videos") or []
+        if not items:
+            break
+
+        # Capture author-level stats from first page
+        if not author_meta and items:
+            author = items[0].get("author") or {}
+            stats = payload.get("stats") or {}
+            author_meta = {
+                "fans": stats.get("followerCount") or author.get("follower_count", 0),
+                "following": stats.get("followingCount") or author.get("following_count", 0),
+                "heart": stats.get("heartCount") or author.get("heart_count", 0),
+                "video": stats.get("videoCount") or author.get("video_count", 0),
+            }
+
+        for v in items:
+            video_id = v.get("video_id") or v.get("aweme_id") or ""
+            create_ts = v.get("create_time") or 0
+            create_iso = (
+                datetime.fromtimestamp(create_ts, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+                if create_ts
+                else None
+            )
+            videos.append({
+                "text": v.get("title", "") or "",
+                "webVideoUrl": f"https://www.tiktok.com/@{uname}/video/{video_id}",
+                "playCount": v.get("play_count", 0),
+                "diggCount": v.get("digg_count", 0),
+                "commentCount": v.get("comment_count", 0),
+                "shareCount": v.get("share_count", 0),
+                "collectCount": v.get("collect_count", 0),
+                "createTime": create_ts,
+                "createTimeISO": create_iso,
+                "authorMeta": author_meta,
+            })
+            if len(videos) >= results:
+                break
+
+        if not payload.get("hasMore"):
+            break
+        cursor = payload.get("cursor", cursor + page_size)
+        time.sleep(1.2)  # respect rate limit
+
+    return videos
 
 
 # ---------- Classify ----------
@@ -182,7 +237,6 @@ def send_whatsapp(text: str) -> None:
     apikey = os.environ["CALLMEBOT_APIKEY"]
     url = "https://api.callmebot.com/whatsapp.php"
 
-    # Chunk by ~1200 chars to stay well under URL / CallMeBot limits
     chunks = []
     buf = ""
     for line in text.split("\n"):
@@ -200,6 +254,5 @@ def send_whatsapp(text: str) -> None:
             params={"phone": phone, "text": chunk, "apikey": apikey},
             timeout=30,
         )
-        # CallMeBot returns 203 on success sometimes, so don't .raise_for_status blindly
         if r.status_code >= 400:
             print(f"[whatsapp] ERROR {r.status_code}: {r.text[:200]}")
