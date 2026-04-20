@@ -1,11 +1,9 @@
 name: Weekly TikTok Top 5
-
 on:
   schedule:
     - cron: '0 9 * * 0'
     - cron: '0 10 * * 0'
   workflow_dispatch:
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -24,4 +22,5 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: python weekly.py
