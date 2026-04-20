@@ -70,8 +70,8 @@ def scrape_profile(username: str, results: int = 100) -> list:
     cursor = "0"
     while len(videos) < results:
         r = requests.get(
-            f"https://{host}/get-user-posts",
-            params={"id": user_id, "cursor": cursor, "count": 30},
+            f"https://{host}/user-posts",
+            params={"user_id": user_id, "count": 30, "max_cursor": cursor, "region": "AU"},
             headers=headers,
             timeout=60,
         )
