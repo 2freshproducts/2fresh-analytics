@@ -83,7 +83,7 @@ def run():
                 continue
 
             desc = v.get("text", "") or ""
-            vtype = classify(desc)
+            vtype = classify(desc, item=v)
             m = compute_ratios(v)
 
             row = [
