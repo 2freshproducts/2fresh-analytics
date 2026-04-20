@@ -29,9 +29,9 @@ def run():
     ensure_tabs_and_headers(sheet)
 
     # DST-safe dedupe: if we already ran today, skip.
-    if already_ran_today(sheet, today_iso):
-        print("[daily] snapshot already exists for today, skipping")
-        return
+    # if already_ran_today(sheet, today_iso):
+    #     print("[daily] snapshot already exists for today, skipping")
+    #     return
 
     total_written = 0
 
@@ -74,6 +74,12 @@ def run():
         for d, count in sorted(date_counts.items(), reverse=True)[:20]:
             marker = " <-- TARGET" if d == str(target_date) else ""
             print(f"  {d}: {count} video(s){marker}")
+
+        # Diagnostic: dump description of every video on the target date
+        for v in videos:
+            pl = parse_post_date(v)
+            if pl and pl.date() == target_date:
+                print(f"[daily] {cfg['label']} target desc: {(v.get('text') or '')[:80]!r}")
 
         # Find videos posted on the Melbourne-local target_date
         matched = 0
