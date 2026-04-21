@@ -45,14 +45,18 @@ ALL_TABS = [
     "Snapshot",
 ]
 
+
 # ---------- ScrapTik scraper (RapidAPI) ----------
-def scrape_profile(username: str, results: int = 100) -> list:
+def scrape_profile(username: str, results: int = 150) -> list:
+    """Fetch `results` most recent videos for a TikTok username via ScrapTik.
+    Uses max_cursor pagination (TikTok-style).
+    """
     key = os.environ["RAPIDAPI_KEY"]
     host = "scraptik.p.rapidapi.com"
     headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": host}
     uname = username.lstrip("@")
 
-    # Step 1: get user ID
+    # Step 1: resolve user ID
     r = requests.get(
         f"https://{host}/get-user",
         params={"username": uname},
@@ -63,23 +67,40 @@ def scrape_profile(username: str, results: int = 100) -> list:
     user_data = r.json().get("user", {})
     user_id = user_data.get("uid")
     if not user_id:
-        raise ValueError(f"Could not resolve uid for {uname}")
+        raise ValueError(f"[scrape] could not resolve uid for {uname}")
+    print(f"[scrape] {uname} uid={user_id}")
 
-    # Step 2: paginate through posts
+    # Step 2: paginate posts using max_cursor (NOT min_cursor)
     videos = []
     cursor = "0"
+    seen_cursors = {cursor}
+    page = 0
     while len(videos) < results:
+        page += 1
         r = requests.get(
             f"https://{host}/user-posts",
-            params={"user_id": user_id, "count": 30, "max_cursor": cursor, "region": "AU"},
+            params={
+                "user_id": user_id,
+                "count": 35,
+                "max_cursor": cursor,
+                "region": "AU",
+            },
             headers=headers,
             timeout=60,
         )
         r.raise_for_status()
         payload = r.json()
         items = payload.get("aweme_list") or []
+        has_more = bool(payload.get("has_more"))
+        next_cursor = str(payload.get("max_cursor", ""))
+        print(
+            f"[scrape] {uname} page {page}: {len(items)} items, "
+            f"has_more={has_more}, next_cursor={next_cursor}"
+        )
+
         if not items:
             break
+
         for v in items:
             author = v.get("author") or {}
             stats = v.get("statistics") or {}
@@ -106,11 +127,20 @@ def scrape_profile(username: str, results: int = 100) -> list:
             })
             if len(videos) >= results:
                 break
-        if not payload.get("has_more"):
+
+        if not has_more:
             break
-        cursor = str(payload.get("min_cursor", cursor))
+        # Safety: bail if cursor hasn't advanced (prevents infinite loop)
+        if not next_cursor or next_cursor in seen_cursors:
+            print(f"[scrape] {uname} cursor stuck at {next_cursor!r}, stopping")
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
         time.sleep(1)
+
+    print(f"[scrape] {uname} total collected: {len(videos)}")
     return videos
+
 
 # ---------- Classify ----------
 def classify(description: str, item: dict = None) -> str:
@@ -120,6 +150,7 @@ def classify(description: str, item: dict = None) -> str:
     if "replying to @" in d[:120] or "replying to " in d[:120]:
         return "comreply"
     return "scripted"
+
 
 # ---------- Metrics ----------
 def compute_ratios(video: dict) -> dict:
@@ -144,6 +175,7 @@ def compute_ratios(video: dict) -> dict:
         ),
     }
 
+
 def parse_post_date(video: dict):
     iso = video.get("createTimeISO")
     if not iso:
@@ -155,6 +187,7 @@ def parse_post_date(video: dict):
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
     return dt.astimezone(MELBOURNE)
 
+
 # ---------- Sheets ----------
 def get_sheet():
     sa_json = json.loads(os.environ["GOOGLE_SA_JSON"])
@@ -164,6 +197,7 @@ def get_sheet():
     )
     gc = gspread.authorize(creds)
     return gc.open_by_key(os.environ["SHEET_ID"])
+
 
 def ensure_tabs_and_headers(sheet):
     existing = {ws.title for ws in sheet.worksheets()}
@@ -178,8 +212,10 @@ def ensure_tabs_and_headers(sheet):
     if snap.row_values(1) != SNAPSHOT_HEADER:
         snap.update([SNAPSHOT_HEADER], "A1")
 
+
 def append_row(sheet, tab_name: str, row: list):
     sheet.worksheet(tab_name).append_row(row, value_input_option="USER_ENTERED")
+
 
 def already_ran_today(sheet, today_iso: str) -> bool:
     try:
@@ -187,6 +223,7 @@ def already_ran_today(sheet, today_iso: str) -> bool:
     except Exception:
         return False
     return today_iso in dates[1:]
+
 
 # ---------- WhatsApp ----------
 def send_whatsapp(text: str) -> None:
