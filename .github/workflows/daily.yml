@@ -1,26 +1,37 @@
 name: Daily TikTok Analytics
+
 on:
   schedule:
+    # Two crons so we land on ~6:45am Melbourne year-round.
+    # AEDT (summer, UTC+11): 6:45am Mel = 19:45 UTC the previous day
+    # AEST (winter, UTC+10): 6:45am Mel = 20:45 UTC the previous day
+    # Dedupe in daily.py prevents double-writes: whichever run is first
+    # writes the Snapshot; the second exits early.
     - cron: '45 19 * * *'
     - cron: '45 20 * * *'
-  workflow_dispatch:
+  workflow_dispatch: {}
+
+concurrency:
+  group: daily-tiktok
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
       - name: Run daily analytics
         env:
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: python daily.py
