@@ -2,11 +2,6 @@ name: Daily TikTok Analytics
 
 on:
   schedule:
-    # Two crons so we land on ~6:45am Melbourne year-round.
-    # AEDT (summer, UTC+11): 6:45am Mel = 19:45 UTC the previous day
-    # AEST (winter, UTC+10): 6:45am Mel = 20:45 UTC the previous day
-    # Dedupe in daily.py prevents double-writes: whichever run is first
-    # writes the Snapshot; the second exits early.
     - cron: '45 19 * * *'
     - cron: '45 20 * * *'
   workflow_dispatch: {}
@@ -31,7 +26,7 @@ jobs:
 
       - name: Run daily analytics
         env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: python daily.py
