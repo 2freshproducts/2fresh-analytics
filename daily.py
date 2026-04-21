@@ -33,15 +33,16 @@ def run():
     for username, cfg in ACCOUNTS.items():
         print(f"[daily] scraping {username}")
         try:
-            videos = scrape_profile(username, results=100)
+            videos = scrape_profile(username, results=150)
         except Exception as e:
-            print(f"[daily] apify failed for {username}: {e}")
+            print(f"[daily] scrape failed for {username}: {e}")
+            traceback.print_exc()
             continue
         if not videos:
             print(f"[daily] no videos returned for {username}")
             continue
 
-        # Author stats live on each video; pull from first
+        # Author stats from the first video
         author = videos[0].get("authorMeta") or {}
         followers = author.get("fans", 0)
         following = author.get("following", 0)
@@ -53,8 +54,8 @@ def run():
         ])
         print(f"[daily] snapshot written {cfg['label']} followers={followers}")
 
-        # Diagnostic: print total items and date histogram
-        print(f"[daily] {cfg['label']} total items returned: {len(videos)}")
+        # Date histogram
+        print(f"[daily] {cfg['label']} total items: {len(videos)}")
         date_counts = {}
         for v in videos:
             pl = parse_post_date(v)
@@ -63,18 +64,18 @@ def run():
                 date_counts[d] = date_counts.get(d, 0) + 1
             else:
                 date_counts["NO_DATE"] = date_counts.get("NO_DATE", 0) + 1
-        print(f"[daily] {cfg['label']} date histogram (most recent first):")
-        for d, count in sorted(date_counts.items(), reverse=True)[:20]:
+        print(f"[daily] {cfg['label']} date histogram (newest first):")
+        for d, count in sorted(date_counts.items(), reverse=True)[:25]:
             marker = " <-- TARGET" if d == str(target_date) else ""
             print(f"  {d}: {count} video(s){marker}")
 
-        # Diagnostic: dump description of every video on the target date
+        # Descriptions on target date
         for v in videos:
             pl = parse_post_date(v)
             if pl and pl.date() == target_date:
                 print(f"[daily] {cfg['label']} target desc: {(v.get('text') or '')[:80]!r}")
 
-        # Find videos posted on the Melbourne-local target_date
+        # Write matched videos
         matched = 0
         for v in videos:
             post_local = parse_post_date(v)
