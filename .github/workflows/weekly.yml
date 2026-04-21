@@ -21,7 +21,7 @@ jobs:
 
       - name: Run weekly summary
         env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
         run: python weekly.py
