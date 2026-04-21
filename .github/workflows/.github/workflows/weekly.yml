@@ -1,26 +1,31 @@
 name: Weekly TikTok Top 5
+
 on:
   schedule:
-    - cron: '0 9 * * 0'
+    # Sunday 8pm Melbourne.
+    # AEDT: 09:00 UTC Sunday. AEST: 10:00 UTC Sunday.
+    # Weekly summary is idempotent-ish (just a message), dedupe not critical,
+    # but we use one cron to avoid double messages.
     - cron: '0 10 * * 0'
-  workflow_dispatch:
+  workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run weekly report
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run weekly summary
         env:
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: python weekly.py
