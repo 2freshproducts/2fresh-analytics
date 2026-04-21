@@ -1,17 +1,13 @@
 """Daily run: analyse the video posted exactly 7 days ago on each account.
-
 Runs ~6:45am Melbourne (two UTC crons for DST coverage; second run is
 no-op'd via Snapshot-tab dedupe).
-
 Writes to 4 tabs: 2F-TalkingHead, 2F-ComReply, R2F-TalkingHead, R2F-ComReply.
 Also appends daily follower snapshot to 'Snapshot' tab.
 Silent (no WhatsApp). Weekly script handles notifications.
 """
-
 import sys
 import traceback
 from datetime import datetime, timedelta
-
 from lib import (
     ACCOUNTS, MELBOURNE,
     scrape_profile, classify, compute_ratios, parse_post_date,
@@ -29,12 +25,11 @@ def run():
     ensure_tabs_and_headers(sheet)
 
     # DST-safe dedupe: if we already ran today, skip.
-     if already_ran_today(sheet, today_iso):
-         print("[daily] snapshot already exists for today, skipping")
-         return
+    if already_ran_today(sheet, today_iso):
+        print("[daily] snapshot already exists for today, skipping")
+        return
 
     total_written = 0
-
     for username, cfg in ACCOUNTS.items():
         print(f"[daily] scraping {username}")
         try:
@@ -42,7 +37,6 @@ def run():
         except Exception as e:
             print(f"[daily] apify failed for {username}: {e}")
             continue
-
         if not videos:
             print(f"[daily] no videos returned for {username}")
             continue
@@ -53,7 +47,6 @@ def run():
         following = author.get("following", 0)
         heart = author.get("heart", 0)
         video_count = author.get("video", 0)
-
         append_row(sheet, "Snapshot", [
             today_iso, cfg["label"],
             followers, following, heart, video_count,
@@ -87,11 +80,9 @@ def run():
             post_local = parse_post_date(v)
             if not post_local or post_local.date() != target_date:
                 continue
-
             desc = v.get("text", "") or ""
             vtype = classify(desc, item=v)
             m = compute_ratios(v)
-
             row = [
                 today_iso,
                 post_local.isoformat(timespec="minutes"),
@@ -110,9 +101,7 @@ def run():
             matched += 1
             total_written += 1
             print(f"[daily] wrote {cfg['label']}/{vtype} -> {v.get('webVideoUrl')}")
-
         print(f"[daily] {cfg['label']} matched {matched} videos for {target_date}")
-
     print(f"[daily] done. rows written: {total_written}")
 
 
