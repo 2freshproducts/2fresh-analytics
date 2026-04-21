@@ -1,13 +1,12 @@
 """Shared helpers for 2fresh TikTok analytics.
 Zero-cost design:
-- ScrapTik via RapidAPI
-- Description-based classifier (no Notion / no ML)
+- Apify clockworks~tiktok-scraper (covered by $5/mo free credit)
+- Description-based classifier
 - gspread for Sheets (free)
 - CallMeBot GET for WhatsApp (free)
 """
 import json
 import os
-import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -46,100 +45,46 @@ ALL_TABS = [
 ]
 
 
-# ---------- ScrapTik scraper (RapidAPI) ----------
-def scrape_profile(username: str, results: int = 150) -> list:
-    """Fetch `results` most recent videos for a TikTok username via ScrapTik.
-    Uses max_cursor pagination (TikTok-style).
+# ---------- Apify scraper ----------
+def scrape_profile(username: str, results: int = 75) -> list:
+    """Fetch ~`results` most recent videos for a TikTok username via Apify
+    clockworks~tiktok-scraper. Returns list in the internal shape daily.py
+    expects (field names match the actor's native output).
     """
-    key = os.environ["RAPIDAPI_KEY"]
-    host = "scraptik.p.rapidapi.com"
-    headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": host}
-    uname = username.lstrip("@")
-
-    # Step 1: resolve user ID
-    r = requests.get(
-        f"https://{host}/get-user",
-        params={"username": uname},
-        headers=headers,
-        timeout=60,
+    token = os.environ["APIFY_TOKEN"]
+    actor = "clockworks~tiktok-scraper"
+    url = (
+        f"https://api.apify.com/v2/acts/{actor}"
+        f"/run-sync-get-dataset-items?token={token}"
     )
+    payload = {
+        "profiles": [username.lstrip("@")],
+        "resultsPerPage": results,
+        "shouldDownloadVideos": False,
+        "shouldDownloadCovers": False,
+        "shouldDownloadSubtitles": False,
+        "shouldDownloadAvatars": False,
+        "shouldDownloadSlideshowImages": False,
+    }
+    print(f"[scrape] {username} requesting {results} items from Apify")
+    try:
+        r = requests.post(url, json=payload, timeout=600)
+    except requests.Timeout:
+        print(f"[scrape] {username} Apify timeout after 10 min")
+        return []
+    if r.status_code == 402:
+        print(f"[scrape] {username} 402 Payment Required — Apify credit exhausted")
+        return []
+    if r.status_code == 401:
+        print(f"[scrape] {username} 401 Unauthorized — check APIFY_TOKEN secret")
+        return []
     r.raise_for_status()
-    user_data = r.json().get("user", {})
-    user_id = user_data.get("uid")
-    if not user_id:
-        raise ValueError(f"[scrape] could not resolve uid for {uname}")
-    print(f"[scrape] {uname} uid={user_id}")
-
-    # Step 2: paginate posts using max_cursor (NOT min_cursor)
-    videos = []
-    cursor = "0"
-    seen_cursors = {cursor}
-    page = 0
-    while len(videos) < results:
-        page += 1
-        r = requests.get(
-            f"https://{host}/user-posts",
-            params={
-                "user_id": user_id,
-                "count": 35,
-                "max_cursor": cursor,
-                "region": "AU",
-            },
-            headers=headers,
-            timeout=60,
-        )
-        r.raise_for_status()
-        payload = r.json()
-        items = payload.get("aweme_list") or []
-        has_more = bool(payload.get("has_more"))
-        next_cursor = str(payload.get("max_cursor", ""))
-        print(
-            f"[scrape] {uname} page {page}: {len(items)} items, "
-            f"has_more={has_more}, next_cursor={next_cursor}"
-        )
-
-        if not items:
-            break
-
-        for v in items:
-            author = v.get("author") or {}
-            stats = v.get("statistics") or {}
-            ts = v.get("create_time") or 0
-            share_url = (v.get("share_info") or {}).get("share_url", "")
-            aweme_id = v.get("aweme_id", "")
-            url = share_url or f"https://www.tiktok.com/@{uname}/video/{aweme_id}"
-            videos.append({
-                "text": v.get("desc", "") or "",
-                "webVideoUrl": url,
-                "playCount": stats.get("play_count", 0),
-                "diggCount": stats.get("digg_count", 0),
-                "commentCount": stats.get("comment_count", 0),
-                "shareCount": stats.get("share_count", 0),
-                "collectCount": stats.get("collect_count", 0),
-                "createTime": ts,
-                "createTimeISO": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if ts else None,
-                "authorMeta": {
-                    "fans": author.get("follower_count", 0),
-                    "following": author.get("following_count", 0),
-                    "heart": author.get("total_favorited", 0),
-                    "video": author.get("aweme_count", 0),
-                },
-            })
-            if len(videos) >= results:
-                break
-
-        if not has_more:
-            break
-        # Safety: bail if cursor hasn't advanced (prevents infinite loop)
-        if not next_cursor or next_cursor in seen_cursors:
-            print(f"[scrape] {uname} cursor stuck at {next_cursor!r}, stopping")
-            break
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
-        time.sleep(1)
-
-    print(f"[scrape] {uname} total collected: {len(videos)}")
-    return videos
+    items = r.json()
+    if not isinstance(items, list):
+        print(f"[scrape] {username} unexpected response shape: {str(items)[:200]}")
+        return []
+    print(f"[scrape] {username} received {len(items)} items")
+    return items
 
 
 # ---------- Classify ----------
