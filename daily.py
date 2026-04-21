@@ -29,9 +29,9 @@ def run():
     ensure_tabs_and_headers(sheet)
 
     # DST-safe dedupe: if we already ran today, skip.
-    # if already_ran_today(sheet, today_iso):
-    #     print("[daily] snapshot already exists for today, skipping")
-    #     return
+     if already_ran_today(sheet, today_iso):
+         print("[daily] snapshot already exists for today, skipping")
+         return
 
     total_written = 0
 
