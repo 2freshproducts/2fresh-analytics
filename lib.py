@@ -90,7 +90,8 @@ def apify_list_profile(username: str, count: int = 15) -> list:
     if r.status_code == 401:
         print(f"[apify.list] {username} 401 Unauthorized — check APIFY_TOKEN")
         return []
-    if r.status_code != 200:
+    # Apify sync API returns 200 or 201 on success
+    if not (200 <= r.status_code < 300):
         print(f"[apify.list] {username} HTTP {r.status_code}: {r.text[:200]}")
         return []
     try:
@@ -141,7 +142,8 @@ def apify_fetch_videos(urls: list) -> list:
     if r.status_code == 401:
         print("[apify.fetch] 401 Unauthorized — check APIFY_TOKEN")
         return []
-    if r.status_code != 200:
+    # Apify sync API returns 200 or 201 on success
+    if not (200 <= r.status_code < 300):
         print(f"[apify.fetch] HTTP {r.status_code}: {r.text[:200]}")
         return []
     try:
