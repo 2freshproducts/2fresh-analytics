@@ -1,48 +1,37 @@
-"""Daily run: analyse the video posted exactly 7 days ago on each account.
-Runs ~6:45am Melbourne (two UTC crons for DST coverage; second run is
-no-op'd via Snapshot-tab dedupe).
-Writes to 4 tabs: 2F-TalkingHead, 2F-ComReply, R2F-TalkingHead, R2F-ComReply.
-Also appends daily follower snapshot to 'Snapshot' tab.
-Silent (no WhatsApp). Weekly script handles notifications.
+"""Daily run (~6:45am Melbourne, dual UTC cron for DST).
+
+Two phases:
+ 1. For each account: scrape 15 latest videos, upsert new URLs to URL Ledger,
+    write follower snapshot.
+ 2. Find ledger entries posted exactly 7 days ago, batch-fetch fresh stats
+    by URL, classify, and write rows to the right tab.
+
+Every video is measured at exactly 7 days post-upload => fair comparison.
+Silent — weekly.py sends WhatsApp summary on Sundays.
 """
 import sys
 import traceback
 from datetime import datetime, timedelta
+
 from lib import (
     ACCOUNTS, MELBOURNE,
-    scrape_profile, classify, compute_ratios, parse_post_date,
+    apify_list_profile, apify_fetch_videos,
+    classify, compute_ratios, parse_post_date,
     get_sheet, ensure_tabs_and_headers, append_row, already_ran_today,
+    read_ledger, upsert_ledger, prune_ledger,
 )
 
 
-def run():
-    today_mel = datetime.now(MELBOURNE).date()
-    target_date = today_mel - timedelta(days=7)
-    today_iso = today_mel.isoformat()
-    print(f"[daily] today_mel={today_iso} target_post_date={target_date}")
-
-    sheet = get_sheet()
-    ensure_tabs_and_headers(sheet)
-
-    # DST-safe dedupe: if we already ran today, skip.
-    if already_ran_today(sheet, today_iso):
-        print("[daily] snapshot already exists for today, skipping")
-        return
-
-    total_written = 0
+def phase1_update_ledger_and_snapshot(sheet, today_iso):
+    """For each account: list 15 latest, upsert to ledger, write snapshot."""
     for username, cfg in ACCOUNTS.items():
-        print(f"[daily] scraping {username}")
-        try:
-            videos = scrape_profile(username, results=150)
-        except Exception as e:
-            print(f"[daily] scrape failed for {username}: {e}")
-            traceback.print_exc()
-            continue
+        print(f"[daily.p1] listing {username}")
+        videos = apify_list_profile(username, count=15)
         if not videos:
-            print(f"[daily] no videos returned for {username}")
+            print(f"[daily.p1] no videos for {username} — skipping snapshot + ledger")
             continue
 
-        # Author stats from the first video
+        # Snapshot from first video's authorMeta
         author = videos[0].get("authorMeta") or {}
         followers = author.get("fans", 0)
         following = author.get("following", 0)
@@ -52,58 +41,148 @@ def run():
             today_iso, cfg["label"],
             followers, following, heart, video_count,
         ])
-        print(f"[daily] snapshot written {cfg['label']} followers={followers}")
+        print(f"[daily.p1] snapshot {cfg['label']} followers={followers}")
 
-        # Date histogram
-        print(f"[daily] {cfg['label']} total items: {len(videos)}")
-        date_counts = {}
-        for v in videos:
-            pl = parse_post_date(v)
-            if pl:
-                d = pl.date().isoformat()
-                date_counts[d] = date_counts.get(d, 0) + 1
-            else:
-                date_counts["NO_DATE"] = date_counts.get("NO_DATE", 0) + 1
-        print(f"[daily] {cfg['label']} date histogram (newest first):")
-        for d, count in sorted(date_counts.items(), reverse=True)[:25]:
-            marker = " <-- TARGET" if d == str(target_date) else ""
-            print(f"  {d}: {count} video(s){marker}")
-
-        # Descriptions on target date
-        for v in videos:
-            pl = parse_post_date(v)
-            if pl and pl.date() == target_date:
-                print(f"[daily] {cfg['label']} target desc: {(v.get('text') or '')[:80]!r}")
-
-        # Write matched videos
-        matched = 0
+        # Build ledger rows from scraped videos
+        new_rows = []
         for v in videos:
             post_local = parse_post_date(v)
-            if not post_local or post_local.date() != target_date:
+            if not post_local:
                 continue
-            desc = v.get("text", "") or ""
-            vtype = classify(desc, item=v)
-            m = compute_ratios(v)
-            row = [
-                today_iso,
-                post_local.isoformat(timespec="minutes"),
+            url = v.get("webVideoUrl") or ""
+            if not url:
+                continue
+            new_rows.append([
+                post_local.date().isoformat(),
                 cfg["label"],
-                "Scripted" if vtype == "scripted" else "Comment Reply",
-                desc[:500],
-                v.get("webVideoUrl", ""),
-                m["views"], m["likes"], m["comments"], m["shares"], m["saves"],
-                m["like_rate"], m["comment_rate"], m["share_rate"], m["save_rate"],
-                m["engagement_rate"],
-                followers,
-                "",  # retention manual
-            ]
-            tab = cfg["scripted_tab"] if vtype == "scripted" else cfg["comreply_tab"]
-            append_row(sheet, tab, row)
-            matched += 1
-            total_written += 1
-            print(f"[daily] wrote {cfg['label']}/{vtype} -> {v.get('webVideoUrl')}")
-        print(f"[daily] {cfg['label']} matched {matched} videos for {target_date}")
-    print(f"[daily] done. rows written: {total_written}")
+                url,
+                today_iso,
+            ])
+        added = upsert_ledger(sheet, new_rows)
+        print(f"[daily.p1] ledger {cfg['label']} +{added} new (saw {len(new_rows)})")
+
+
+def phase2_fetch_and_write(sheet, today_mel):
+    """Find ledger entries posted exactly 7 days ago, fetch fresh stats, write rows."""
+    target_date = (today_mel - timedelta(days=7)).isoformat()
+    today_iso = today_mel.isoformat()
+    print(f"[daily.p2] target_post_date={target_date}")
+
+    ledger = read_ledger(sheet)
+    target_entries = [e for e in ledger if e["post_date"] == target_date]
+    print(f"[daily.p2] ledger has {len(target_entries)} entries for {target_date}")
+
+    if not target_entries:
+        print("[daily.p2] nothing to fetch today")
+        return 0
+
+    # Map label -> username so we can find scripted/comreply tabs by label
+    label_to_cfg = {cfg["label"]: cfg for cfg in ACCOUNTS.values()}
+
+    # Batch-fetch all target URLs in a single Apify run
+    urls = [e["url"] for e in target_entries]
+    fetched = apify_fetch_videos(urls)
+    print(f"[daily.p2] Apify returned {len(fetched)} items for {len(urls)} URLs")
+
+    # Map fetched items by URL for lookup
+    by_url = {}
+    for v in fetched:
+        u = v.get("webVideoUrl") or ""
+        if u:
+            by_url[u] = v
+
+    # Read latest follower counts from Snapshot for "Followers at scrape"
+    followers_by_label = _latest_followers(sheet)
+
+    written = 0
+    for entry in target_entries:
+        url = entry["url"]
+        label = entry["account"]
+        cfg = label_to_cfg.get(label)
+        if not cfg:
+            print(f"[daily.p2] unknown label '{label}' in ledger, skipping {url}")
+            continue
+
+        v = by_url.get(url)
+        if not v:
+            print(f"[daily.p2] {label} no fetch result for {url} — skipping")
+            continue
+
+        post_local = parse_post_date(v)
+        if not post_local:
+            print(f"[daily.p2] {label} no post date for {url} — skipping")
+            continue
+
+        desc = v.get("text", "") or ""
+        vtype = classify(desc, item=v)
+        m = compute_ratios(v)
+        followers = followers_by_label.get(label, "")
+        row = [
+            today_iso,
+            post_local.isoformat(timespec="minutes"),
+            label,
+            "Scripted" if vtype == "scripted" else "Comment Reply",
+            desc[:500],
+            url,
+            m["views"], m["likes"], m["comments"], m["shares"], m["saves"],
+            m["like_rate"], m["comment_rate"], m["share_rate"], m["save_rate"],
+            m["engagement_rate"],
+            followers,
+            "",  # retention manual
+        ]
+        tab = cfg["scripted_tab"] if vtype == "scripted" else cfg["comreply_tab"]
+        append_row(sheet, tab, row)
+        written += 1
+        print(f"[daily.p2] wrote {label}/{vtype} -> {url}")
+
+    print(f"[daily.p2] rows written: {written}")
+    return written
+
+
+def _latest_followers(sheet) -> dict:
+    """Return {label: followers_int} from the latest Snapshot row per account."""
+    try:
+        ws = sheet.worksheet("Snapshot")
+        rows = ws.get_all_values()
+    except Exception:
+        return {}
+    out = {}
+    for r in rows[1:]:
+        if len(r) < 3:
+            continue
+        label = r[1]
+        try:
+            out[label] = int(r[2])
+        except Exception:
+            continue
+    return out
+
+
+def run():
+    today_mel = datetime.now(MELBOURNE).date()
+    today_iso = today_mel.isoformat()
+    print(f"[daily] today_mel={today_iso}")
+
+    sheet = get_sheet()
+    ensure_tabs_and_headers(sheet)
+
+    # DST-safe dedupe: if Snapshot already has a row for today, skip entirely.
+    if already_ran_today(sheet, today_iso):
+        print("[daily] snapshot already exists for today, skipping")
+        return
+
+    # Phase 1: list profiles, upsert ledger, snapshot
+    phase1_update_ledger_and_snapshot(sheet, today_iso)
+
+    # Phase 2: fetch 7-day-old videos by URL, write rows
+    phase2_fetch_and_write(sheet, today_mel)
+
+    # House-keeping: prune ledger rows older than retention
+    removed = prune_ledger(sheet, today_mel)
+    if removed:
+        print(f"[daily] pruned {removed} stale ledger rows")
+
+    print("[daily] done.")
 
 
 if __name__ == "__main__":
