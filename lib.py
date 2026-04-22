@@ -263,12 +263,40 @@ def append_row(sheet, tab_name: str, row: list):
 
 
 def already_ran_today(sheet, today_iso: str) -> bool:
-    """Return True if today's Snapshot already has any row (DST dedup)."""
+    """Return True only if EVERY account has a Snapshot row for today_iso.
+    Partial-run safe: if the previous cron crashed after writing 2F but before
+    R2F, this returns False so the next cron retries R2F.
+    """
+    expected = {cfg["label"] for cfg in ACCOUNTS.values()}
+    return snapshot_labels_for_date(sheet, today_iso) >= expected
+
+
+def snapshot_labels_for_date(sheet, date_iso: str) -> set:
+    """Return set of account labels that have a Snapshot row for date_iso."""
     try:
-        dates = sheet.worksheet("Snapshot").col_values(1)
+        rows = sheet.worksheet("Snapshot").get_all_values()
     except Exception:
-        return False
-    return today_iso in dates[1:]
+        return set()
+    out = set()
+    for r in rows[1:]:
+        if len(r) >= 2 and r[0] == date_iso:
+            out.add(r[1])
+    return out
+
+
+def urls_written_for_date(sheet, tab: str, date_iso: str) -> set:
+    """Return set of URLs already written to `tab` on analysis_date == date_iso.
+    Used by phase 2 to avoid duplicate rows after a partial-run retry.
+    """
+    try:
+        rows = sheet.worksheet(tab).get_all_values()
+    except Exception:
+        return set()
+    out = set()
+    for r in rows[1:]:
+        if len(r) > 5 and r[0] == date_iso and r[5]:
+            out.add(r[5])
+    return out
 
 
 # ---------- URL Ledger helpers ----------
