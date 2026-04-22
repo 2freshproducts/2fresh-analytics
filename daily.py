@@ -1,8 +1,10 @@
 """Daily run (~6:45am Melbourne, dual UTC cron for DST).
 
 Two phases:
- 1. For each account: scrape 15 latest videos, upsert new URLs to URL Ledger,
+ 1. For each account: scrape latest videos, upsert new URLs to URL Ledger,
     write follower snapshot.
+     - Normal mode: 15 per account (cheap, daily maintenance)
+     - Bootstrap mode: 60 per account (one-time, when ledger lacks 8-day coverage)
  2. Find ledger entries posted exactly 7 days ago, batch-fetch fresh stats
     by URL, classify, and write rows to the right tab.
 
@@ -22,11 +24,34 @@ from lib import (
 )
 
 
-def phase1_update_ledger_and_snapshot(sheet, today_iso):
-    """For each account: list 15 latest, upsert to ledger, write snapshot."""
+BOOTSTRAP_COUNT = 60      # first-time / recovery scrape size
+NORMAL_COUNT = 15         # daily maintenance scrape size
+COVERAGE_DAYS = 8         # ledger must have >=1 entry this old or bootstrap triggers
+
+
+def _needs_bootstrap(ledger, today_mel_date) -> bool:
+    """True if ledger lacks an entry older than COVERAGE_DAYS from today."""
+    if not ledger:
+        return True
+    oldest_needed = today_mel_date - timedelta(days=COVERAGE_DAYS)
+    for e in ledger:
+        pd_str = e.get("post_date", "")
+        if not pd_str:
+            continue
+        try:
+            pd = datetime.fromisoformat(pd_str).date()
+        except Exception:
+            continue
+        if pd <= oldest_needed:
+            return False
+    return True
+
+
+def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
+    """For each account: list latest videos, upsert to ledger, write snapshot."""
     for username, cfg in ACCOUNTS.items():
-        print(f"[daily.p1] listing {username}")
-        videos = apify_list_profile(username, count=15)
+        print(f"[daily.p1] listing {username} count={count}")
+        videos = apify_list_profile(username, count=count)
         if not videos:
             print(f"[daily.p1] no videos for {username} — skipping snapshot + ledger")
             continue
@@ -76,7 +101,7 @@ def phase2_fetch_and_write(sheet, today_mel):
         print("[daily.p2] nothing to fetch today")
         return 0
 
-    # Map label -> username so we can find scripted/comreply tabs by label
+    # Map label -> account config so we can find tabs by label
     label_to_cfg = {cfg["label"]: cfg for cfg in ACCOUNTS.values()}
 
     # Batch-fetch all target URLs in a single Apify run
@@ -91,7 +116,7 @@ def phase2_fetch_and_write(sheet, today_mel):
         if u:
             by_url[u] = v
 
-    # Read latest follower counts from Snapshot for "Followers at scrape"
+    # Read latest follower counts from Snapshot for the "Followers at scrape" column
     followers_by_label = _latest_followers(sheet)
 
     written = 0
@@ -171,8 +196,17 @@ def run():
         print("[daily] snapshot already exists for today, skipping")
         return
 
+    # Decide bootstrap vs normal
+    existing_ledger = read_ledger(sheet)
+    bootstrap = _needs_bootstrap(existing_ledger, today_mel)
+    count = BOOTSTRAP_COUNT if bootstrap else NORMAL_COUNT
+    if bootstrap:
+        print(f"[daily] BOOTSTRAP MODE — ledger lacks {COVERAGE_DAYS}+ day coverage, fetching {count} per account")
+    else:
+        print(f"[daily] normal mode — fetching {count} per account")
+
     # Phase 1: list profiles, upsert ledger, snapshot
-    phase1_update_ledger_and_snapshot(sheet, today_iso)
+    phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count)
 
     # Phase 2: fetch 7-day-old videos by URL, write rows
     phase2_fetch_and_write(sheet, today_mel)
