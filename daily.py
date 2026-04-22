@@ -20,6 +20,7 @@ from lib import (
     apify_list_profile, apify_fetch_videos,
     classify, compute_ratios, parse_post_date,
     get_sheet, ensure_tabs_and_headers, append_row, already_ran_today,
+    snapshot_labels_for_date, urls_written_for_date,
     read_ledger, upsert_ledger, prune_ledger,
 )
 
@@ -48,8 +49,15 @@ def _needs_bootstrap(ledger, today_mel_date) -> bool:
 
 
 def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
-    """For each account: list latest videos, upsert to ledger, write snapshot."""
+    """For each account: list latest videos, upsert to ledger, write snapshot.
+    Per-account dedupe: if an account already has today's snapshot row
+    (from a previous partial run), skip to avoid duplicates.
+    """
+    existing_today = snapshot_labels_for_date(sheet, today_iso)
     for username, cfg in ACCOUNTS.items():
+        if cfg["label"] in existing_today:
+            print(f"[daily.p1] {cfg['label']} already snapshotted for {today_iso}, skipping")
+            continue
         print(f"[daily.p1] listing {username} count={count}")
         videos = apify_list_profile(username, count=count)
         if not videos:
@@ -119,6 +127,12 @@ def phase2_fetch_and_write(sheet, today_mel):
     # Read latest follower counts from Snapshot for the "Followers at scrape" column
     followers_by_label = _latest_followers(sheet)
 
+    # Per-URL dedupe for today: avoid duplicates if we retry after partial failure
+    already_written = {
+        tab: urls_written_for_date(sheet, tab, today_iso)
+        for tab in ["2F-TalkingHead", "2F-ComReply", "R2F-TalkingHead", "R2F-ComReply"]
+    }
+
     written = 0
     for entry in target_entries:
         url = entry["url"]
@@ -156,7 +170,11 @@ def phase2_fetch_and_write(sheet, today_mel):
             "",  # retention manual
         ]
         tab = cfg["scripted_tab"] if vtype == "scripted" else cfg["comreply_tab"]
+        if url in already_written.get(tab, set()):
+            print(f"[daily.p2] {label} already wrote {url} to {tab} today, skipping")
+            continue
         append_row(sheet, tab, row)
+        already_written.setdefault(tab, set()).add(url)
         written += 1
         print(f"[daily.p2] wrote {label}/{vtype} -> {url}")
 
