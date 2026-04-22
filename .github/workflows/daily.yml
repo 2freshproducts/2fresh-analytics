@@ -2,6 +2,11 @@ name: Daily TikTok Analytics
 
 on:
   schedule:
+    # Two crons so we land on ~6:45am Melbourne year-round.
+    # AEDT (summer, UTC+11): 6:45am Mel = 19:45 UTC the previous day
+    # AEST (winter, UTC+10): 6:45am Mel = 20:45 UTC the previous day
+    # Dedupe in daily.py prevents double-writes: first run writes Snapshot,
+    # second run sees Snapshot row and exits.
     - cron: '45 19 * * *'
     - cron: '45 20 * * *'
   workflow_dispatch: {}
@@ -13,7 +18,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
