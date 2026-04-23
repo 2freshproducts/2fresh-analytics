@@ -8,6 +8,7 @@ Zero-cost design (runs on Apify $5/mo free credit):
 """
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -23,11 +24,13 @@ ACCOUNTS = {
         "scripted_tab": "2F-TalkingHead",
         "comreply_tab": "2F-ComReply",
         "label": "2F",
+        "notion_db_env": "NOTION_DB_2F",
     },
     "ryan2fresh_": {
         "scripted_tab": "R2F-TalkingHead",
         "comreply_tab": "R2F-ComReply",
         "label": "R2F",
+        "notion_db_env": "NOTION_DB_R2F",
     },
 }
 
@@ -158,12 +161,12 @@ def apify_fetch_videos(urls: list) -> list:
     return items
 
 
-# ---------- Classify (deep scan) ----------
+# ---------- Classify (deep scan fallback) ----------
 def classify(description: str, item: dict = None) -> str:
-    """Return 'comreply' if the video is a comment reply, else 'scripted'.
-    Checks description first (cheap), then deep-scans all fields of the item
-    (handles Apify variations where the 'Replying to @...' prefix lives in a
-    different field).
+    """Legacy fallback classifier. Only used if Notion lookup fails AND
+    deep-scan finds no 'Replying to...' string. Given your captions don't
+    carry that prefix, this almost always returns 'scripted' — prefer
+    classify_via_notion().
     """
     if description:
         d = description.lower()
@@ -184,6 +187,191 @@ def classify(description: str, item: dict = None) -> str:
         except Exception as e:
             print(f"[classify] deep-scan error: {e}")
     return "scripted"
+
+
+# ---------- Notion classifier ----------
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+NOTION_TITLE_PROP = "Video Title"
+NOTION_DATE_PROP = "Post Date"
+NOTION_TAGS_PROP = "Tags"
+NOTION_TAG_TH = "TalkingHead"
+NOTION_TAG_CR = "ComReply"
+
+# Minimal stopword set — keep short to avoid dropping short-title tokens.
+_STOPWORDS = {"a", "an", "the", "of", "to", "in", "on", "for", "and", "or", "is"}
+
+
+def _normalize_tokens(text: str) -> set:
+    """Lowercase, strip urls/mentions/hashtags/punct → set of tokens."""
+    if not text:
+        return set()
+    t = text.lower()
+    t = re.sub(r"http\S+", " ", t)
+    t = re.sub(r"[@#]", " ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    out = set()
+    for w in t.split():
+        if not w or w in _STOPWORDS:
+            continue
+        if len(w) < 2:
+            continue
+        out.add(w)
+    return out
+
+
+def _parse_notion_page(page: dict):
+    """Extract {title, title_tokens, post_date, tag, page_id} from a page dict.
+    Returns None if required fields missing.
+    """
+    props = page.get("properties", {})
+    # Title (rich_text list under "title")
+    title_prop = props.get(NOTION_TITLE_PROP) or {}
+    title_items = title_prop.get("title") or []
+    title = "".join(item.get("plain_text", "") for item in title_items).strip()
+    if not title:
+        return None
+    # Date
+    date_prop = props.get(NOTION_DATE_PROP) or {}
+    date_obj = date_prop.get("date") or {}
+    date_str = (date_obj.get("start") or "").split("T")[0]
+    if not date_str:
+        return None
+    try:
+        post_date = datetime.fromisoformat(date_str).date()
+    except Exception:
+        return None
+    # Tag — handle both select and multi_select
+    tags_prop = props.get(NOTION_TAGS_PROP) or {}
+    tag_val = None
+    if tags_prop.get("select"):
+        tag_val = tags_prop["select"].get("name")
+    elif "multi_select" in tags_prop:
+        names = [o.get("name") for o in (tags_prop.get("multi_select") or []) if o.get("name")]
+        for preferred in (NOTION_TAG_TH, NOTION_TAG_CR):
+            if preferred in names:
+                tag_val = preferred
+                break
+        if not tag_val and names:
+            tag_val = names[0]
+    if not tag_val:
+        return None
+    return {
+        "title": title,
+        "title_tokens": _normalize_tokens(title),
+        "post_date": post_date,
+        "tag": tag_val,
+        "page_id": page.get("id", ""),
+    }
+
+
+def notion_fetch_pages(db_id: str, today_date, days_back: int = 30) -> list:
+    """Fetch Notion pages whose Post Date is within [today-days_back, today+2].
+    Returns [] if NOTION_TOKEN missing, db not shared, or any error.
+    """
+    token = os.environ.get("NOTION_TOKEN", "")
+    if not token:
+        print("[notion] NOTION_TOKEN not set — skipping Notion lookup")
+        return []
+    if not db_id:
+        print("[notion] db_id empty — skipping")
+        return []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    start = (today_date - timedelta(days=days_back)).isoformat()
+    end = (today_date + timedelta(days=2)).isoformat()
+    url = f"{NOTION_API}/databases/{db_id}/query"
+    out = []
+    cursor = None
+    while True:
+        body = {
+            "filter": {
+                "and": [
+                    {"property": NOTION_DATE_PROP, "date": {"on_or_after": start}},
+                    {"property": NOTION_DATE_PROP, "date": {"on_or_before": end}},
+                ]
+            },
+            "page_size": 100,
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        try:
+            r = requests.post(url, json=body, headers=headers, timeout=30)
+        except Exception as e:
+            print(f"[notion] query error: {e}")
+            return out
+        if r.status_code == 404:
+            print(f"[notion] db {db_id[:8]}… not found / not shared with integration")
+            return out
+        if r.status_code == 401:
+            print("[notion] 401 — bad NOTION_TOKEN")
+            return out
+        if r.status_code != 200:
+            print(f"[notion] HTTP {r.status_code}: {r.text[:200]}")
+            return out
+        data = r.json()
+        for page in data.get("results", []):
+            parsed = _parse_notion_page(page)
+            if parsed:
+                out.append(parsed)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    print(f"[notion] db {db_id[:8]}… fetched {len(out)} pages in {days_back}d window")
+    return out
+
+
+def classify_via_notion(caption: str, post_date_local, notion_pages: list,
+                        assigned_ids: set = None):
+    """Match a TikTok video to a Notion page.
+    Returns (classification, matched_page_or_None).
+    classification: 'scripted' (TalkingHead), 'comreply' (ComReply), or None if no match.
+    Scoring: fraction of Notion title tokens present in caption tokens.
+    Filters: |date diff| <= 2 days, >=2 shared tokens (or all tokens if title is 1 word),
+    score >= 0.6. Ties broken by nearer date, then more tokens matched.
+    If assigned_ids is supplied, already-matched page_ids are excluded.
+    """
+    if not notion_pages:
+        return None, None
+    cap_tokens = _normalize_tokens(caption)
+    if not cap_tokens:
+        return None, None
+    video_date = post_date_local.date() if hasattr(post_date_local, "date") else post_date_local
+    assigned_ids = assigned_ids or set()
+    best = None  # (score, -days_diff, common_count, page)
+    for page in notion_pages:
+        if page["page_id"] in assigned_ids:
+            continue
+        days_diff = abs((page["post_date"] - video_date).days)
+        if days_diff > 2:
+            continue
+        page_tokens = page["title_tokens"]
+        if not page_tokens:
+            continue
+        common = page_tokens & cap_tokens
+        if not common:
+            continue
+        # Single-token titles must match fully; longer titles need >=2 shared.
+        if len(page_tokens) == 1:
+            if len(common) < 1:
+                continue
+        else:
+            if len(common) < 2:
+                continue
+        score = len(common) / len(page_tokens)
+        if score < 0.6:
+            continue
+        key = (score, -days_diff, len(common))
+        if best is None or key > best[0]:
+            best = (key, page)
+    if not best:
+        return None, None
+    page = best[1]
+    cls = "comreply" if page["tag"] == NOTION_TAG_CR else "scripted"
+    return cls, page
 
 
 # ---------- Metrics ----------
