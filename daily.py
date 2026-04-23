@@ -11,6 +11,7 @@ Two phases:
 Every video is measured at exactly 7 days post-upload => fair comparison.
 Silent — weekly.py sends WhatsApp summary on Sundays.
 """
+import os
 import sys
 import traceback
 from datetime import datetime, timedelta
@@ -18,7 +19,8 @@ from datetime import datetime, timedelta
 from lib import (
     ACCOUNTS, MELBOURNE,
     apify_list_profile, apify_fetch_videos,
-    classify, compute_ratios, parse_post_date,
+    classify, classify_via_notion, notion_fetch_pages,
+    compute_ratios, parse_post_date,
     get_sheet, ensure_tabs_and_headers, append_row, already_ran_today,
     snapshot_labels_for_date, urls_written_for_date,
     read_ledger, upsert_ledger, prune_ledger,
@@ -96,7 +98,12 @@ def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
 
 
 def phase2_fetch_and_write(sheet, today_mel):
-    """Find ledger entries posted exactly 7 days ago, fetch fresh stats, write rows."""
+    """Find ledger entries posted exactly 7 days ago, fetch fresh stats, write rows.
+
+    Classification: query Notion per account, fuzzy-match caption+date to
+    pages, route by the page's 'Tags' (TalkingHead/ComReply). If no Notion
+    match, default to ComReply (majority class) and log loudly.
+    """
     target_date = (today_mel - timedelta(days=7)).isoformat()
     today_iso = today_mel.isoformat()
     print(f"[daily.p2] target_post_date={target_date}")
@@ -109,7 +116,6 @@ def phase2_fetch_and_write(sheet, today_mel):
         print("[daily.p2] nothing to fetch today")
         return 0
 
-    # Map label -> account config so we can find tabs by label
     label_to_cfg = {cfg["label"]: cfg for cfg in ACCOUNTS.values()}
 
     # Batch-fetch all target URLs in a single Apify run
@@ -117,17 +123,29 @@ def phase2_fetch_and_write(sheet, today_mel):
     fetched = apify_fetch_videos(urls)
     print(f"[daily.p2] Apify returned {len(fetched)} items for {len(urls)} URLs")
 
-    # Map fetched items by URL for lookup
     by_url = {}
     for v in fetched:
         u = v.get("webVideoUrl") or ""
         if u:
             by_url[u] = v
 
-    # Read latest follower counts from Snapshot for the "Followers at scrape" column
+    # Pre-fetch Notion pages once per account that has target entries
+    labels_with_entries = {e["account"] for e in target_entries}
+    notion_by_label = {}
+    for label in labels_with_entries:
+        cfg = label_to_cfg.get(label)
+        if not cfg:
+            continue
+        db_id = os.environ.get(cfg.get("notion_db_env", ""), "")
+        pages = notion_fetch_pages(db_id, today_mel, days_back=30) if db_id else []
+        notion_by_label[label] = pages
+
+    # Track which Notion pages we've already consumed, per label (so two videos
+    # don't both claim the same Notion page).
+    assigned_by_label = {label: set() for label in labels_with_entries}
+
     followers_by_label = _latest_followers(sheet)
 
-    # Per-URL dedupe for today: avoid duplicates if we retry after partial failure
     already_written = {
         tab: urls_written_for_date(sheet, tab, today_iso)
         for tab in ["2F-TalkingHead", "2F-ComReply", "R2F-TalkingHead", "R2F-ComReply"]
@@ -153,7 +171,33 @@ def phase2_fetch_and_write(sheet, today_mel):
             continue
 
         desc = v.get("text", "") or ""
-        vtype = classify(desc, item=v)
+
+        # Primary: Notion match
+        notion_pages = notion_by_label.get(label, [])
+        vtype, matched = classify_via_notion(
+            desc, post_local, notion_pages,
+            assigned_ids=assigned_by_label.get(label),
+        )
+        source = "notion"
+        if matched:
+            assigned_by_label[label].add(matched["page_id"])
+            print(f"[daily.p2] {label} NOTION MATCH: '{matched['title']}' "
+                  f"({matched['tag']}) → {url}")
+        else:
+            # Secondary: deep-scan (returns 'scripted' unless caption contains "replying to")
+            fallback = classify(desc, item=v)
+            if fallback == "comreply":
+                vtype = "comreply"
+                source = "deepscan"
+            else:
+                # Tertiary: default to ComReply (majority class) + loud warning
+                vtype = "comreply"
+                source = "default-comreply"
+                print(f"[daily.p2] {label} NO NOTION MATCH for {url} "
+                      f"caption={desc[:120]!r} — defaulting to ComReply. "
+                      f"Add/fix a Notion page (±2 days of {post_local.date().isoformat()}) "
+                      f"whose Video Title overlaps the caption.")
+
         m = compute_ratios(v)
         followers = followers_by_label.get(label, "")
         row = [
@@ -176,7 +220,7 @@ def phase2_fetch_and_write(sheet, today_mel):
         append_row(sheet, tab, row)
         already_written.setdefault(tab, set()).add(url)
         written += 1
-        print(f"[daily.p2] wrote {label}/{vtype} -> {url}")
+        print(f"[daily.p2] wrote {label}/{vtype} [src={source}] -> {url}")
 
     print(f"[daily.p2] rows written: {written}")
     return written
