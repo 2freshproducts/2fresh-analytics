@@ -1,22 +1,16 @@
 """Weekly WhatsApp summary — Sunday 8pm Melbourne.
-Pure reader: reads sheet tabs, computes top 3 scripted + top 3 comment-reply
-performers from the last 7 days (by views), sends WhatsApp via CallMeBot.
-No scraping — costs nothing.
+Pure reader: reads the per-account video tabs + Snapshot, computes follower
+growth and top videos by views over the last 7 days, sends WhatsApp via
+CallMeBot. No scraping — costs nothing.
 """
 import sys
 import traceback
 from datetime import datetime, timedelta
 
 from lib import (
-    MELBOURNE, ACCOUNTS,
+    MELBOURNE, ACCOUNTS, VIDEO_TABS,
     get_sheet, send_whatsapp,
 )
-
-
-VIDEO_TABS = {
-    "scripted": ["2F-TalkingHead", "R2F-TalkingHead"],
-    "comreply": ["2F-ComReply", "R2F-ComReply"],
-}
 
 
 def _safe_int(s):
@@ -34,7 +28,12 @@ def _safe_float(s):
 
 
 def read_recent_rows(sheet, tabs: list, since_iso: str) -> list:
-    """Return rows where Analysis date >= since_iso across the given tabs."""
+    """Rows where Analysis date >= since_iso across the given tabs.
+    Column layout (18 cols): 0=Analysis date, 1=Post date, 2=Account, 3=Type,
+    4=Description, 5=URL, 6=Views, 7=Likes, 8=Comments, 9=Shares, 10=Saves,
+    11=Like%, 12=Comment%, 13=Share%, 14=Save%, 15=Engagement%,
+    16=Followers at scrape, 17=Retention%
+    """
     out = []
     for tab in tabs:
         try:
@@ -73,7 +72,6 @@ def follower_growth(sheet, since_iso: str) -> dict:
         rows = ws.get_all_values()
     except Exception:
         return {}
-    # Oldest-on-or-after since_iso and latest per label
     start_per = {}
     end_per = {}
     for r in rows[1:]:
@@ -84,7 +82,6 @@ def follower_growth(sheet, since_iso: str) -> dict:
         if date >= since_iso:
             if label not in start_per or date < start_per[label][0]:
                 start_per[label] = (date, followers)
-        # track absolute latest
         if label not in end_per or date > end_per[label][0]:
             end_per[label] = (date, followers)
     out = {}
@@ -97,12 +94,11 @@ def follower_growth(sheet, since_iso: str) -> dict:
     return out
 
 
-def format_summary(scripted_rows, comreply_rows, growth) -> str:
+def format_summary(video_rows, growth) -> str:
     lines = []
     lines.append("🎯 2Fresh Weekly TikTok Summary")
     lines.append("")
 
-    # Follower growth
     if growth:
         lines.append("📈 Follower growth (7d):")
         for label, (s, e, d) in sorted(growth.items()):
@@ -110,12 +106,12 @@ def format_summary(scripted_rows, comreply_rows, growth) -> str:
             lines.append(f"  {label}: {s:,} → {e:,} ({sign}{d:,})")
         lines.append("")
 
-    # Top scripted
-    lines.append("🎬 Top scripted (by views):")
-    if not scripted_rows:
-        lines.append("  (no scripted videos tracked this week)")
+    # Top 6 videos overall (across both accounts) by views
+    lines.append("🎬 Top 6 videos by views:")
+    if not video_rows:
+        lines.append("  (no videos tracked this week)")
     else:
-        top = sorted(scripted_rows, key=lambda x: x["views"], reverse=True)[:3]
+        top = sorted(video_rows, key=lambda x: x["views"], reverse=True)[:6]
         for i, r in enumerate(top, 1):
             desc = (r["description"] or "").replace("\n", " ")[:60]
             lines.append(
@@ -125,29 +121,23 @@ def format_summary(scripted_rows, comreply_rows, growth) -> str:
             lines.append(f"     {desc}")
     lines.append("")
 
-    # Top comment replies
-    lines.append("💬 Top comment replies (by views):")
-    if not comreply_rows:
-        lines.append("  (no comment replies tracked this week)")
-    else:
-        top = sorted(comreply_rows, key=lambda x: x["views"], reverse=True)[:3]
-        for i, r in enumerate(top, 1):
-            desc = (r["description"] or "").replace("\n", " ")[:60]
+    # Per-account stats
+    by_account = {}
+    for r in video_rows:
+        a = r["account"]
+        by_account.setdefault(a, []).append(r)
+    if by_account:
+        lines.append("📊 Per account (7d):")
+        for label in sorted(by_account.keys()):
+            rows = by_account[label]
+            count = len(rows)
+            total_views = sum(r["views"] for r in rows)
+            avg_eng = (sum(r["engagement_rate"] for r in rows) / count) if count else 0
             lines.append(
-                f"  {i}. {r['account']} · {r['views']:,} views · "
-                f"{r['engagement_rate']}% eng"
+                f"  {label}: {count} videos · {total_views:,} views · "
+                f"{avg_eng:.2f}% avg eng"
             )
-            lines.append(f"     {desc}")
-    lines.append("")
 
-    # Totals
-    total_scripted = len(scripted_rows)
-    total_comreply = len(comreply_rows)
-    total_views = sum(r["views"] for r in scripted_rows + comreply_rows)
-    lines.append(
-        f"📊 Captured this week: {total_scripted} scripted · "
-        f"{total_comreply} comment replies · {total_views:,} total views"
-    )
     return "\n".join(lines)
 
 
@@ -157,15 +147,13 @@ def run():
     print(f"[weekly] reading rows since {since}")
 
     sheet = get_sheet()
-    scripted = read_recent_rows(sheet, VIDEO_TABS["scripted"], since)
-    comreply = read_recent_rows(sheet, VIDEO_TABS["comreply"], since)
+    videos = read_recent_rows(sheet, VIDEO_TABS, since)
     growth = follower_growth(sheet, since)
 
-    print(f"[weekly] scripted rows: {len(scripted)}")
-    print(f"[weekly] comreply rows: {len(comreply)}")
+    print(f"[weekly] video rows: {len(videos)}")
     print(f"[weekly] growth labels: {list(growth.keys())}")
 
-    msg = format_summary(scripted, comreply, growth)
+    msg = format_summary(videos, growth)
     print("[weekly] message:\n" + msg)
 
     send_whatsapp(msg)
