@@ -6,12 +6,14 @@ Two phases:
      - Normal mode: 15 per account (cheap, daily maintenance)
      - Bootstrap mode: 60 per account (one-time, when ledger lacks 8-day coverage)
  2. Find ledger entries posted exactly 7 days ago, batch-fetch fresh stats
-    by URL, classify, and write rows to the right tab.
+    by URL, write rows to that account's video tab.
 
 Every video is measured at exactly 7 days post-upload => fair comparison.
 Silent — weekly.py sends WhatsApp summary on Sundays.
+
+Classification (scripted vs comment-reply) is deferred to a future bot that
+reads the Description column. This script writes Type as empty string.
 """
-import os
 import sys
 import traceback
 from datetime import datetime, timedelta
@@ -19,21 +21,20 @@ from datetime import datetime, timedelta
 from lib import (
     ACCOUNTS, MELBOURNE,
     apify_list_profile, apify_fetch_videos,
-    classify, classify_via_notion, notion_fetch_pages,
     compute_ratios, parse_post_date,
     get_sheet, ensure_tabs_and_headers, append_row, already_ran_today,
     snapshot_labels_for_date, urls_written_for_date,
     read_ledger, upsert_ledger, prune_ledger,
+    VIDEO_TABS,
 )
 
 
 BOOTSTRAP_COUNT = 60      # first-time / recovery scrape size
-NORMAL_COUNT = 15         # daily maintenance scrape size
+NORMAL_COUNT = 15         # daily maintenance (covers 2F's 12/day + buffer)
 COVERAGE_DAYS = 8         # ledger must have >=1 entry this old or bootstrap triggers
 
 
 def _needs_bootstrap(ledger, today_mel_date) -> bool:
-    """True if ledger lacks an entry older than COVERAGE_DAYS from today."""
     if not ledger:
         return True
     oldest_needed = today_mel_date - timedelta(days=COVERAGE_DAYS)
@@ -51,10 +52,6 @@ def _needs_bootstrap(ledger, today_mel_date) -> bool:
 
 
 def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
-    """For each account: list latest videos, upsert to ledger, write snapshot.
-    Per-account dedupe: if an account already has today's snapshot row
-    (from a previous partial run), skip to avoid duplicates.
-    """
     existing_today = snapshot_labels_for_date(sheet, today_iso)
     for username, cfg in ACCOUNTS.items():
         if cfg["label"] in existing_today:
@@ -66,7 +63,6 @@ def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
             print(f"[daily.p1] no videos for {username} — skipping snapshot + ledger")
             continue
 
-        # Snapshot from first video's authorMeta
         author = videos[0].get("authorMeta") or {}
         followers = author.get("fans", 0)
         following = author.get("following", 0)
@@ -78,7 +74,6 @@ def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
         ])
         print(f"[daily.p1] snapshot {cfg['label']} followers={followers}")
 
-        # Build ledger rows from scraped videos
         new_rows = []
         for v in videos:
             post_local = parse_post_date(v)
@@ -98,12 +93,7 @@ def phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count):
 
 
 def phase2_fetch_and_write(sheet, today_mel):
-    """Find ledger entries posted exactly 7 days ago, fetch fresh stats, write rows.
-
-    Classification: query Notion per account, fuzzy-match caption+date to
-    pages, route by the page's 'Tags' (TalkingHead/ComReply). If no Notion
-    match, default to ComReply (majority class) and log loudly.
-    """
+    """Fetch stats for URLs posted exactly 7 days ago, write to per-account tabs."""
     target_date = (today_mel - timedelta(days=7)).isoformat()
     today_iso = today_mel.isoformat()
     print(f"[daily.p2] target_post_date={target_date}")
@@ -118,7 +108,6 @@ def phase2_fetch_and_write(sheet, today_mel):
 
     label_to_cfg = {cfg["label"]: cfg for cfg in ACCOUNTS.values()}
 
-    # Batch-fetch all target URLs in a single Apify run
     urls = [e["url"] for e in target_entries]
     fetched = apify_fetch_videos(urls)
     print(f"[daily.p2] Apify returned {len(fetched)} items for {len(urls)} URLs")
@@ -129,26 +118,11 @@ def phase2_fetch_and_write(sheet, today_mel):
         if u:
             by_url[u] = v
 
-    # Pre-fetch Notion pages once per account that has target entries
-    labels_with_entries = {e["account"] for e in target_entries}
-    notion_by_label = {}
-    for label in labels_with_entries:
-        cfg = label_to_cfg.get(label)
-        if not cfg:
-            continue
-        db_id = os.environ.get(cfg.get("notion_db_env", ""), "")
-        pages = notion_fetch_pages(db_id, today_mel, days_back=30) if db_id else []
-        notion_by_label[label] = pages
-
-    # Track which Notion pages we've already consumed, per label (so two videos
-    # don't both claim the same Notion page).
-    assigned_by_label = {label: set() for label in labels_with_entries}
-
     followers_by_label = _latest_followers(sheet)
 
     already_written = {
         tab: urls_written_for_date(sheet, tab, today_iso)
-        for tab in ["2F-TalkingHead", "2F-ComReply", "R2F-TalkingHead", "R2F-ComReply"]
+        for tab in VIDEO_TABS
     }
 
     written = 0
@@ -171,63 +145,35 @@ def phase2_fetch_and_write(sheet, today_mel):
             continue
 
         desc = v.get("text", "") or ""
-
-        # Primary: Notion match
-        notion_pages = notion_by_label.get(label, [])
-        vtype, matched = classify_via_notion(
-            desc, post_local, notion_pages,
-            assigned_ids=assigned_by_label.get(label),
-        )
-        source = "notion"
-        if matched:
-            assigned_by_label[label].add(matched["page_id"])
-            print(f"[daily.p2] {label} NOTION MATCH: '{matched['title']}' "
-                  f"({matched['tag']}) → {url}")
-        else:
-            # Secondary: deep-scan (returns 'scripted' unless caption contains "replying to")
-            fallback = classify(desc, item=v)
-            if fallback == "comreply":
-                vtype = "comreply"
-                source = "deepscan"
-            else:
-                # Tertiary: default to ComReply (majority class) + loud warning
-                vtype = "comreply"
-                source = "default-comreply"
-                print(f"[daily.p2] {label} NO NOTION MATCH for {url} "
-                      f"caption={desc[:120]!r} — defaulting to ComReply. "
-                      f"Add/fix a Notion page (±2 days of {post_local.date().isoformat()}) "
-                      f"whose Video Title overlaps the caption.")
-
         m = compute_ratios(v)
         followers = followers_by_label.get(label, "")
         row = [
             today_iso,
             post_local.isoformat(timespec="minutes"),
             label,
-            "Scripted" if vtype == "scripted" else "Comment Reply",
+            "",                 # Type — future bot fills this in
             desc[:500],
             url,
             m["views"], m["likes"], m["comments"], m["shares"], m["saves"],
             m["like_rate"], m["comment_rate"], m["share_rate"], m["save_rate"],
             m["engagement_rate"],
             followers,
-            "",  # retention manual
+            "",                 # retention manual
         ]
-        tab = cfg["scripted_tab"] if vtype == "scripted" else cfg["comreply_tab"]
+        tab = cfg["videos_tab"]
         if url in already_written.get(tab, set()):
             print(f"[daily.p2] {label} already wrote {url} to {tab} today, skipping")
             continue
         append_row(sheet, tab, row)
         already_written.setdefault(tab, set()).add(url)
         written += 1
-        print(f"[daily.p2] wrote {label}/{vtype} [src={source}] -> {url}")
+        print(f"[daily.p2] wrote {label} -> {url}")
 
     print(f"[daily.p2] rows written: {written}")
     return written
 
 
 def _latest_followers(sheet) -> dict:
-    """Return {label: followers_int} from the latest Snapshot row per account."""
     try:
         ws = sheet.worksheet("Snapshot")
         rows = ws.get_all_values()
@@ -253,27 +199,21 @@ def run():
     sheet = get_sheet()
     ensure_tabs_and_headers(sheet)
 
-    # DST-safe dedupe: if Snapshot already has a row for today, skip entirely.
     if already_ran_today(sheet, today_iso):
         print("[daily] snapshot already exists for today, skipping")
         return
 
-    # Decide bootstrap vs normal
     existing_ledger = read_ledger(sheet)
     bootstrap = _needs_bootstrap(existing_ledger, today_mel)
     count = BOOTSTRAP_COUNT if bootstrap else NORMAL_COUNT
     if bootstrap:
-        print(f"[daily] BOOTSTRAP MODE — ledger lacks {COVERAGE_DAYS}+ day coverage, fetching {count} per account")
+        print(f"[daily] BOOTSTRAP MODE — fetching {count} per account")
     else:
         print(f"[daily] normal mode — fetching {count} per account")
 
-    # Phase 1: list profiles, upsert ledger, snapshot
     phase1_update_ledger_and_snapshot(sheet, today_mel, today_iso, count)
-
-    # Phase 2: fetch 7-day-old videos by URL, write rows
     phase2_fetch_and_write(sheet, today_mel)
 
-    # House-keeping: prune ledger rows older than retention
     removed = prune_ledger(sheet, today_mel)
     if removed:
         print(f"[daily] pruned {removed} stale ledger rows")
