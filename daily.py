@@ -29,8 +29,9 @@ from lib import (
 )
 
 
-BOOTSTRAP_COUNT = 60      # first-time / recovery scrape size
-NORMAL_COUNT = 15         # daily maintenance (covers 2F's 12/day + buffer)
+BOOTSTRAP_COUNT = 120     # first-time / recovery scrape size — covers ~10
+                          # days at 2F's 12/day rate so Phase 2 works next run
+NORMAL_COUNT = 20         # daily maintenance (2F's 12/day + 8 buffer for surges)
 COVERAGE_DAYS = 8         # ledger must have >=1 entry this old or bootstrap triggers
 
 
