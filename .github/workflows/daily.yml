@@ -34,7 +34,4 @@ jobs:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_2F: ${{ secrets.NOTION_DB_2F }}
-          NOTION_DB_R2F: ${{ secrets.NOTION_DB_R2F }}
         run: python daily.py
